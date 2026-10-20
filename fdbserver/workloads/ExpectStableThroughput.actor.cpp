@@ -61,7 +61,8 @@ class ExpectStableThroughputWorkload : public TestWorkload {
 				return Void();
 			} catch (Error& e) {
 				self->finishTransaction(tr);
-				if (e.code() == error_code_proxy_tag_throttled && now() > self->startTime + self->warmupTime) {
+				if ((e.code() == error_code_proxy_tag_throttled || e.code() == error_code_tag_throttled) &&
+				    now() > self->startTime + self->warmupTime) {
 					++self->tagThrottledErrors;
 				}
 				wait(tr.onError(e));

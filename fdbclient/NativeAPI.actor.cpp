@@ -7832,7 +7832,49 @@ double ClientTagThrottleData::throttleDuration() const {
 		return std::max(0.0, expiration - now());
 	}
 
-	return std::min(expiration - now(), capacity / tpsRate);
+	// Below one transaction of capacity, including at or below zero, wait for the missing capacity at tpsRate.
+	return std::min(expiration - now(), (1.0 - capacity) / tpsRate);
+}
+
+namespace {
+
+// Checks and releases the transactions of one read version reply at the same instant, as extractReadVersion does.
+// Returns the number of transactions released.
+int releaseReadVersionBatch(ClientTagThrottleData& throttle, int batchSize) {
+	int released = 0;
+	for (int i = 0; i < batchSize; ++i) {
+		if (throttle.throttleDuration() <= 0) {
+			throttle.addReleased(1);
+			++released;
+		}
+	}
+	return released;
+}
+
+ACTOR Future<Void> checkBatchedReleases(double tpsRate) {
+	state std::unique_ptr<ClientTagThrottleData> throttle = std::make_unique<ClientTagThrottleData>(
+	    ClientTagThrottleLimits(tpsRate, ClientTagThrottleLimits::NO_EXPIRATION));
+	state int smoothingWindowTransactions = static_cast<int>(tpsRate * CLIENT_KNOBS->TAG_THROTTLE_SMOOTHING_WINDOW);
+
+	// Each release raises the smoothed released rate by 1 / TAG_THROTTLE_SMOOTHING_WINDOW. The batch must stop once
+	// that rate reaches tpsRate, not step past the point where the remaining capacity is exactly zero.
+	ASSERT_EQ(releaseReadVersionBatch(*throttle, 10 * smoothingWindowTransactions), smoothingWindowTransactions);
+	ASSERT(std::abs(throttle->throttleDuration() - 1.0 / tpsRate) < 1e-9);
+
+	wait(delay(2 * CLIENT_KNOBS->TAG_THROTTLE_SMOOTHING_WINDOW));
+	ASSERT_EQ(throttle->throttleDuration(), 0.0);
+	ASSERT_GE(releaseReadVersionBatch(*throttle, 10 * smoothingWindowTransactions), 1);
+	return Void();
+}
+
+} // namespace
+
+// A tag's transactions that share one read version reply must keep being throttled once the first of them use up the
+// tag's capacity.
+TEST_CASE("/fdbclient/NativeAPI/ClientTagThrottleData/BatchedReleases") {
+	wait(checkBatchedReleases(1.0));
+	wait(checkBatchedReleases(10.0));
+	return Void();
 }
 
 uint32_t Transaction::getSize() {
