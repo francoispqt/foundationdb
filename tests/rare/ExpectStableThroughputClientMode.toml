@@ -1,0 +1,26 @@
+# ExpectStableThroughput with tag quotas enforced by clients instead of GRV proxies. All actors start their
+# transactions together, so a tag's transactions share read version replies.
+[configuration]
+buggify = false
+tenantModes = ['disabled']
+
+[[knobs]]
+global_tag_throttling = true
+enforce_tag_throttling_on_proxies = false
+
+[[test]]
+testTitle='ExpectStableThroughputClientMode'
+
+  [[test.workload]]
+  testName='ThroughputQuota'
+  transactionTag='testTag'
+  totalQuotaInPages=1000
+
+  [[test.workload]]
+  testName='ExpectStableThroughput'
+  throttlingTag='testTag'
+  expectedThroughputPagesRate=1000
+  errorTolerance=0.3
+  numActors=100
+  attemptedTransactionRatePerActor=4
+  opsPerTransaction=5

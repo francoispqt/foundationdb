@@ -22,6 +22,9 @@
 #include "fdbserver/Knobs.h"
 #include "fdbserver/TransactionTagCounter.h"
 #include "flow/Trace.h"
+
+#include <cmath>
+
 #include "flow/actorcompiler.h"
 
 class TransactionTagCounterImpl {
@@ -29,6 +32,8 @@ class TransactionTagCounterImpl {
 	TransactionTagMap<double> intervalCosts;
 	double intervalTotalCost = 0;
 	double intervalStart = 0;
+	// now() can be exactly 0 at the start of a simulation, so intervalStart alone cannot tell whether an interval began.
+	bool intervalStarted = false;
 	int maxTagsTracked;
 	double minRateTracked;
 
@@ -76,12 +81,14 @@ public:
 	void startNewInterval() {
 		double elapsed = now() - intervalStart;
 		previousBusiestTags.clear();
-		if (intervalStart > 0 && CLIENT_KNOBS->READ_TAG_SAMPLE_RATE > 0 && elapsed > 0) {
+		if (intervalStarted && CLIENT_KNOBS->READ_TAG_SAMPLE_RATE > 0 && elapsed > 0) {
 			previousBusiestTags = getBusiestTagsFromLastInterval(elapsed);
 
 			// For status, report the busiest tag:
 			if (previousBusiestTags.empty()) {
-				TraceEvent("BusiestReadTag", thisServerID).detail("TagCost", 0.0);
+				TraceEvent("BusiestReadTag", thisServerID)
+				    .detail("TagCost", static_cast<int64_t>(0))
+				    .trackLatest(busiestReadTagEventHolder->trackingKey);
 			} else {
 				auto busiestTagInfo = previousBusiestTags[0];
 				for (int i = 1; i < previousBusiestTags.size(); ++i) {
@@ -90,10 +97,13 @@ public:
 						busiestTagInfo = tagInfo;
 					}
 				}
+				// TagCost is a whole number in both events, so that older status, which reads it with getInt64, can
+				// parse it, and the field keeps one type.
 				TraceEvent("BusiestReadTag", thisServerID)
 				    .detail("Tag", printable(busiestTagInfo.tag))
-				    .detail("TagCost", busiestTagInfo.rate)
-				    .detail("FractionalBusyness", busiestTagInfo.fractionalBusyness);
+				    .detail("TagCost", static_cast<int64_t>(std::llround(busiestTagInfo.rate)))
+				    .detail("FractionalBusyness", busiestTagInfo.fractionalBusyness)
+				    .trackLatest(busiestReadTagEventHolder->trackingKey);
 			}
 
 			for (const auto& tagInfo : previousBusiestTags) {
@@ -107,6 +117,7 @@ public:
 		intervalCosts.clear();
 		intervalTotalCost = 0;
 		intervalStart = now();
+		intervalStarted = true;
 	}
 
 	std::vector<BusyTagInfo> const& getBusiestTags() const { return previousBusiestTags; }
@@ -145,7 +156,8 @@ TagSet getTagSet(TransactionTagRef tag) {
 } // namespace
 
 TEST_CASE("/fdbserver/TransactionTagCounter/IgnoreBeyondMaxTags") {
-	state TransactionTagCounter counter(UID(),
+	state UID thisServerID(1, 1);
+	state TransactionTagCounter counter(thisServerID,
 	                                    /*maxTagsTracked=*/2,
 	                                    /*minRateTracked=*/10.0 * CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE /
 	                                        CLIENT_KNOBS->READ_TAG_SAMPLE_RATE);
@@ -163,12 +175,18 @@ TEST_CASE("/fdbserver/TransactionTagCounter/IgnoreBeyondMaxTags") {
 		ASSERT(containsTag(busiestTags, "tagA"_sr));
 		ASSERT(!containsTag(busiestTags, "tagB"_sr));
 		ASSERT(containsTag(busiestTags, "tagC"_sr));
+		// Status reads the busiest tag from latestEventCache, not from getBusiestTags().
+		TraceEventFields const latest = latestEventCache.get(thisServerID.toString() + "/BusiestReadTag");
+		std::string const busiestTag = latest.getValue("Tag");
+		ASSERT(busiestTag == "tagA" || busiestTag == "tagC");
+		ASSERT_GT(latest.getDouble("TagCost"), 0.0);
 	}
 	return Void();
 }
 
 TEST_CASE("/fdbserver/TransactionTagCounter/IgnoreBelowMinRate") {
-	state TransactionTagCounter counter(UID(),
+	state UID thisServerID(2, 2);
+	state TransactionTagCounter counter(thisServerID,
 	                                    /*maxTagsTracked=*/2,
 	                                    /*minRateTracked=*/10.0 * CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE /
 	                                        CLIENT_KNOBS->READ_TAG_SAMPLE_RATE);
@@ -180,6 +198,9 @@ TEST_CASE("/fdbserver/TransactionTagCounter/IgnoreBelowMinRate") {
 		counter.startNewInterval();
 		auto const busiestTags = counter.getBusiestTags();
 		ASSERT_EQ(busiestTags.size(), 0);
+		TraceEventFields const latest = latestEventCache.get(thisServerID.toString() + "/BusiestReadTag");
+		ASSERT(latest.size() > 0);
+		ASSERT_EQ(latest.getDouble("TagCost"), 0.0);
 	}
 	return Void();
 }

@@ -120,6 +120,7 @@ class GlobalTagThrottlerImpl {
 		Optional<ThrottleApi::TagQuotaValue> quota;
 		HoltLinearSmoother transactionCounter;
 		Smoother perClientRate;
+		bool perClientRateSet{ false };
 		Smoother targetRate;
 		double transactionsLastAdded;
 		double lastLogged;
@@ -136,7 +137,10 @@ class GlobalTagThrottlerImpl {
 
 		void setQuota(ThrottleApi::TagQuotaValue quota) { this->quota = quota; }
 
-		void clearQuota() { quota = {}; }
+		void clearQuota() {
+			quota = {};
+			perClientRateSet = false;
+		}
 
 		void addTransactions(int count) {
 			transactionsLastAdded = now();
@@ -146,6 +150,12 @@ class GlobalTagThrottlerImpl {
 		double getTransactionRate() const { return transactionCounter.smoothRate(); }
 
 		ClientTagThrottleLimits updateAndGetPerClientLimit(double targetTps) {
+			if (!perClientRateSet) {
+				// Clients are not limited yet, so start the feedback below from the target. From zero, every new
+				// quota would start each client at GLOBAL_TAG_THROTTLING_MIN_RATE.
+				perClientRate.reset(targetTps);
+				perClientRateSet = true;
+			}
 			auto newPerClientRate = std::max(
 			    SERVER_KNOBS->GLOBAL_TAG_THROTTLING_MIN_RATE,
 			    std::min(targetTps, (targetTps / transactionCounter.smoothRate()) * perClientRate.smoothTotal()));
@@ -950,6 +960,30 @@ TEST_CASE("/GlobalTagThrottler/RemoveQuota") {
 	globalTagThrottler.removeQuota(testTag);
 	monitor = monitorActor(&globalTagThrottler, [](auto& gtt) { return targetRateIsNear(gtt, "sampleTag1"_sr, {}); });
 	wait(timeoutError(monitor || client || updater, 600.0));
+	return Void();
+}
+
+// 10 storage servers can handle 100 pages/second each.
+// Client attempts 5 6-page read transactions per second, with no quota for 20 seconds.
+// Total quota is then set to 100 pages/second, which allows 100/6 transactions per second.
+// The quota does not bind, so the client's limit never drops below the 5 transactions per second it performs.
+TEST_CASE("/GlobalTagThrottler/NewQuotaStartsAtTarget") {
+	state GlobalTagThrottler globalTagThrottler = getTestGlobalTagThrottler();
+	state StorageServerCollection storageServers(10, 100);
+	state TransactionTag testTag = "sampleTag1"_sr;
+	state Future<Void> client = runClient(&globalTagThrottler, &storageServers, testTag, 5.0, 6.0, OpType::READ);
+	state Future<Void> updater = updateGlobalTagThrottler(&globalTagThrottler, &storageServers);
+	wait(delay(20.0) || client || updater);
+	ThrottleApi::TagQuotaValue tagQuotaValue;
+	tagQuotaValue.totalQuota = 100 * CLIENT_KNOBS->TAG_THROTTLING_PAGE_SIZE;
+	globalTagThrottler.setQuota(testTag, tagQuotaValue);
+	state int checks = 0;
+	for (; checks < 30; ++checks) {
+		auto const tpsLimit = getTPSLimit(globalTagThrottler, testTag);
+		ASSERT(tpsLimit.present());
+		ASSERT_GE(tpsLimit.get(), 5.0);
+		wait(delay(1.0) || client || updater);
+	}
 	return Void();
 }
 
