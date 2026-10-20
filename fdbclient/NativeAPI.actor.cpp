@@ -7506,11 +7506,14 @@ ACTOR Future<Void> readVersionBatcher(DatabaseContext* cx,
 	}
 }
 
+// releasedTags are the tags whose throttles already counted this transaction as released before its read version
+// request (see TransactionState::getReadVersion); the reply does not check or release them again.
 ACTOR Future<Version> extractReadVersion(Reference<TransactionState> trState,
                                          Location location,
                                          SpanContext spanContext,
                                          Future<GetReadVersionReply> f,
-                                         Promise<Optional<Value>> metadataVersion) {
+                                         Promise<Optional<Value>> metadataVersion,
+                                         TagSet releasedTags) {
 	state Span span(spanContext, location, trState->spanContext);
 	GetReadVersionReply rep = wait(f);
 	double replyTime = now();
@@ -7557,7 +7560,8 @@ ACTOR Future<Version> extractReadVersion(Reference<TransactionState> trState,
 			if (itr != priorityThrottledTags.end()) {
 				if (itr->second.expired()) {
 					priorityThrottledTags.erase(itr);
-				} else if (itr->second.throttleDuration() > 0) {
+				} else if (std::find(releasedTags.begin(), releasedTags.end(), tag) == releasedTags.end() &&
+				           itr->second.throttleDuration() > 0) {
 					CODE_PROBE(true, "throttling transaction after getting read version");
 					++trState->cx->transactionReadVersionsThrottled;
 					throw tag_throttled();
@@ -7567,7 +7571,8 @@ ACTOR Future<Version> extractReadVersion(Reference<TransactionState> trState,
 
 		for (auto& tag : trState->options.tags) {
 			auto itr = priorityThrottledTags.find(tag);
-			if (itr != priorityThrottledTags.end()) {
+			if (itr != priorityThrottledTags.end() &&
+			    std::find(releasedTags.begin(), releasedTags.end(), tag) == releasedTags.end()) {
 				itr->second.addReleased(1);
 			}
 		}
@@ -7645,6 +7650,7 @@ Future<Version> TransactionState::getReadVersion(uint32_t flags) {
 		ASSERT(false);
 	}
 
+	TagSet releasedTags;
 	if (options.tags.size() != 0) {
 		double maxThrottleDelay = 0.0;
 		bool canRecheck = false;
@@ -7674,6 +7680,13 @@ Future<Version> TransactionState::getReadVersion(uint32_t flags) {
 			auto itr = priorityThrottledTags.find(tag);
 			if (itr != priorityThrottledTags.end()) {
 				itr->second.updateChecked();
+				// Count the transaction as released before its request, so that the rest of its read version batch
+				// sees it. Otherwise the whole batch is requested, and counted by the GRV proxy, before the reply
+				// refuses the transactions beyond the tag's capacity. A recheck is checked when its reply arrives.
+				if (maxThrottleDelay == 0.0) {
+					itr->second.addReleased(1);
+					releasedTags.addTag(tag);
+				}
 			}
 		}
 	}
@@ -7689,8 +7702,12 @@ Future<Version> TransactionState::getReadVersion(uint32_t flags) {
 	auto const req = DatabaseContext::VersionRequest(derivedSpanContext, options.tags, versionDebugID);
 	batcher.stream.send(req);
 	startTime = now();
-	return extractReadVersion(
-	    Reference<TransactionState>::addRef(this), location, spanContext, req.reply.getFuture(), metadataVersion);
+	return extractReadVersion(Reference<TransactionState>::addRef(this),
+	                          location,
+	                          spanContext,
+	                          req.reply.getFuture(),
+	                          metadataVersion,
+	                          std::move(releasedTags));
 }
 
 Optional<Version> Transaction::getCachedReadVersion() const {

@@ -1,0 +1,86 @@
+# ExpectStableThroughput with tag quotas enforced by clients, and one-page transactions that start in batches of 1, 2,
+# 4 and 8, each batch sharing one read version request. Transactions the client throttles are not retried, so the
+# batches stay whole.
+[configuration]
+buggify = false
+tenantModes = ['disabled']
+
+[[knobs]]
+global_tag_throttling = true
+enforce_tag_throttling_on_proxies = false
+
+[[test]]
+testTitle='ExpectStableThroughputClientModeBatchesOf1'
+
+  [[test.workload]]
+  testName='ThroughputQuota'
+  transactionTag='batchesOf1'
+  totalQuotaInPages=50
+
+  [[test.workload]]
+  testName='ExpectStableThroughput'
+  throttlingTag='batchesOf1'
+  expectedThroughputPagesRate=50
+  errorTolerance=0.2
+  testDuration=600.0
+  numActors=1
+  attemptedTransactionRatePerActor=200
+  opsPerTransaction=1
+  transactionsPerBatch=1
+
+[[test]]
+testTitle='ExpectStableThroughputClientModeBatchesOf2'
+
+  [[test.workload]]
+  testName='ThroughputQuota'
+  transactionTag='batchesOf2'
+  totalQuotaInPages=50
+
+  [[test.workload]]
+  testName='ExpectStableThroughput'
+  throttlingTag='batchesOf2'
+  expectedThroughputPagesRate=50
+  errorTolerance=0.2
+  testDuration=600.0
+  numActors=1
+  attemptedTransactionRatePerActor=200
+  opsPerTransaction=1
+  transactionsPerBatch=2
+
+[[test]]
+testTitle='ExpectStableThroughputClientModeBatchesOf4'
+
+  [[test.workload]]
+  testName='ThroughputQuota'
+  transactionTag='batchesOf4'
+  totalQuotaInPages=50
+
+  [[test.workload]]
+  testName='ExpectStableThroughput'
+  throttlingTag='batchesOf4'
+  expectedThroughputPagesRate=50
+  errorTolerance=0.2
+  testDuration=600.0
+  numActors=1
+  attemptedTransactionRatePerActor=200
+  opsPerTransaction=1
+  transactionsPerBatch=4
+
+[[test]]
+testTitle='ExpectStableThroughputClientModeBatchesOf8'
+
+  [[test.workload]]
+  testName='ThroughputQuota'
+  transactionTag='batchesOf8'
+  totalQuotaInPages=50
+
+  [[test.workload]]
+  testName='ExpectStableThroughput'
+  throttlingTag='batchesOf8'
+  expectedThroughputPagesRate=50
+  errorTolerance=0.2
+  testDuration=600.0
+  numActors=1
+  attemptedTransactionRatePerActor=200
+  opsPerTransaction=1
+  transactionsPerBatch=8

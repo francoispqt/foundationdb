@@ -33,6 +33,7 @@ class ExpectStableThroughputWorkload : public TestWorkload {
 	double attemptedTransactionRatePerActor;
 	double warmupTime;
 	int opsPerTransaction;
+	int transactionsPerBatch;
 
 	double startTime;
 
@@ -61,18 +62,30 @@ class ExpectStableThroughputWorkload : public TestWorkload {
 				return Void();
 			} catch (Error& e) {
 				self->finishTransaction(tr);
-				if ((e.code() == error_code_proxy_tag_throttled || e.code() == error_code_tag_throttled) &&
-				    now() > self->startTime + self->warmupTime) {
+				bool const throttled =
+				    e.code() == error_code_proxy_tag_throttled || e.code() == error_code_tag_throttled;
+				if (throttled && now() > self->startTime + self->warmupTime) {
 					++self->tagThrottledErrors;
+				}
+				// A retry would start apart from the rest of its batch.
+				if (throttled && self->transactionsPerBatch > 1) {
+					return Void();
 				}
 				wait(tr.onError(e));
 			}
 		}
 	}
 
+	// Starts transactionsPerBatch transactions at the same instant, so that they share a read version request.
 	ACTOR static Future<Void> runClient(ExpectStableThroughputWorkload* self, Database cx) {
+		state std::vector<Future<Void>> transactions;
 		loop {
-			wait(delay(1 / self->attemptedTransactionRatePerActor) && runTransaction(self, cx));
+			transactions.clear();
+			for (int i = 0; i < self->transactionsPerBatch; ++i) {
+				transactions.push_back(runTransaction(self, cx));
+			}
+			wait(delay(self->transactionsPerBatch / self->attemptedTransactionRatePerActor) &&
+			     waitForAll(transactions));
 		}
 	}
 
@@ -88,6 +101,7 @@ public:
 		attemptedTransactionRatePerActor = getOption(options, "attemptedTransactionRatePerActor"_sr, 0.4);
 		warmupTime = getOption(options, "warmupTime"_sr, 10.0);
 		opsPerTransaction = getOption(options, "opsPerTransaction"_sr, 5);
+		transactionsPerBatch = getOption(options, "transactionsPerBatch"_sr, 1);
 	}
 
 	Future<Void> setup(Database const& cx) override { return Void(); }
